@@ -1,0 +1,175 @@
+import json
+import logging
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+import pika
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from app.db import get_order_by_idempotency_key, init_db, save_order
+
+SERVICE_NAME = os.getenv("SERVICE_NAME", "order-service")
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
+RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
+RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
+RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "guest")
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "maltashop.events")
+ROUTING_KEY = os.getenv("ROUTING_KEY", "order.placed")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
+logger = logging.getLogger(SERVICE_NAME)
+
+app = FastAPI(title="MaltaShop Order Service")
+
+
+def log_event(level: str, message: str, correlation_id: str, **extra: object) -> None:
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "service": SERVICE_NAME,
+        "correlation_id": correlation_id,
+        "message": message,
+        **extra,
+    }
+    logger.info(json.dumps(payload))
+
+
+class OrderCreateRequest(BaseModel):
+    customer_id: str = Field(..., min_length=1)
+    item_id: str = Field(..., min_length=1)
+    quantity: int = Field(..., gt=0)
+    amount: float = Field(..., gt=0)
+
+
+def publish_order_placed(event: dict, correlation_id: str) -> None:
+    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+    params = pika.ConnectionParameters(
+        host=RABBITMQ_HOST,
+        port=RABBITMQ_PORT,
+        credentials=credentials,
+        connection_attempts=5,
+        retry_delay=1.0,
+    )
+    connection = pika.BlockingConnection(params)
+    try:
+        channel = connection.channel()
+        channel.exchange_declare(
+            exchange=EXCHANGE_NAME,
+            exchange_type="topic",
+            durable=True,
+        )
+        channel.basic_publish(
+            exchange=EXCHANGE_NAME,
+            routing_key=ROUTING_KEY,
+            body=json.dumps(event).encode("utf-8"),
+            properties=pika.BasicProperties(
+                delivery_mode=2,
+                content_type="application/json",
+                headers={"x-correlation-id": correlation_id},
+            ),
+        )
+    finally:
+        if connection.is_open:
+            connection.close()
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
+    log_event("INFO", "order-service started", correlation_id="startup")
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "service": SERVICE_NAME}
+
+
+@app.post("/orders", status_code=201)
+def create_order(
+    order_in: OrderCreateRequest,
+    request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-Id"),
+) -> dict:
+    correlation_id = x_correlation_id or str(uuid.uuid4())
+    effective_key = idempotency_key or str(uuid.uuid4())
+
+    existing = get_order_by_idempotency_key(effective_key)
+    if existing:
+        log_event(
+            "INFO",
+            "Duplicate order request returned via idempotency key",
+            correlation_id=existing["correlation_id"],
+            order_id=existing["order_id"],
+            idempotency_key=effective_key,
+        )
+        return {
+            "order_id": existing["order_id"],
+            "status": existing["status"],
+            "correlation_id": existing["correlation_id"],
+            "idempotent_replay": True,
+        }
+
+    order_id = f"ord-{uuid.uuid4().hex[:8]}"
+    created_at = datetime.now(timezone.utc).isoformat()
+    order_record = {
+        "idempotency_key": effective_key,
+        "order_id": order_id,
+        "customer_id": order_in.customer_id,
+        "item_id": order_in.item_id,
+        "quantity": order_in.quantity,
+        "amount": order_in.amount,
+        "correlation_id": correlation_id,
+        "status": "ORDER_PLACED",
+        "created_at": created_at,
+    }
+
+    save_order(order_record)
+
+    event_payload = {
+        "event_type": "OrderPlaced",
+        "event_id": f"evt-{uuid.uuid4().hex[:8]}",
+        "occurred_at": created_at,
+        "correlation_id": correlation_id,
+        "data": {
+            "order_id": order_id,
+            "customer_id": order_in.customer_id,
+            "item_id": order_in.item_id,
+            "quantity": order_in.quantity,
+            "amount": order_in.amount,
+        },
+    }
+
+    try:
+        publish_order_placed(event_payload, correlation_id)
+    except Exception as exc:
+        log_event(
+            "ERROR",
+            "Failed to publish OrderPlaced event",
+            correlation_id=correlation_id,
+            order_id=order_id,
+            error=str(exc),
+        )
+        raise HTTPException(status_code=503, detail="Message broker unavailable")
+
+    log_event(
+        "INFO",
+        "Order created and OrderPlaced event published",
+        correlation_id=correlation_id,
+        order_id=order_id,
+        customer_id=order_in.customer_id,
+        amount=order_in.amount,
+    )
+
+    return {
+        "order_id": order_id,
+        "status": order_record["status"],
+        "correlation_id": correlation_id,
+        "idempotent_replay": False,
+    }
