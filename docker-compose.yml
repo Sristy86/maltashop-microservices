@@ -1,0 +1,54 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: maltashop-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: maltashop-order-service
+    ports:
+      - "8000:8000"
+    environment:
+      SERVICE_NAME: order-service
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      EXCHANGE_NAME: maltashop.events
+      ROUTING_KEY: order.placed
+      HTTP_PORT: "8000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: maltashop-notification-service
+    ports:
+      - "8001:8001"
+    environment:
+      SERVICE_NAME: notification-service
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      EXCHANGE_NAME: maltashop.events
+      QUEUE_NAME: notifications.order_placed
+      BINDING_KEY: order.placed
+      HTTP_PORT: "8001"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+        
